@@ -20,7 +20,10 @@ async function findOrCreateLead(phone) {
   };
 
   // Search for existing lead
-  let searchRes = await fetch(`${process.env.ZOHO_BASE_URL}/crm/v2/Leads/search?phone=${phone}`, { headers });
+  let searchRes = await fetch(
+    `${process.env.ZOHO_BASE_URL}/crm/v2/Leads/search?phone=${phone}`,
+    { headers }
+  );
   let searchData = await searchRes.json();
 
   if (searchData.data && searchData.data.length > 0) {
@@ -32,7 +35,13 @@ async function findOrCreateLead(phone) {
     method: "POST",
     headers,
     body: JSON.stringify({
-      data: [{ Last_Name: "Incoming Lead", Phone: phone, Company: "Unknown" }]
+      data: [
+        {
+          Last_Name: "Incoming Lead",
+          Phone: phone,
+          Company: "Unknown"
+        }
+      ]
     })
   });
   let createData = await createRes.json();
@@ -50,12 +59,18 @@ async function createTask(leadId, subject) {
     method: "POST",
     headers,
     body: JSON.stringify({
-      data: [{
-        Subject: subject,
-        Who_Id: leadId,
-        Due_Date: new Date(Date.now() + (process.env.TASK_DUE_HOURS || 24) * 60 * 60 * 1000).toISOString().split("T")[0],
-        Status: "Not Started"
-      }]
+      data: [
+        {
+          Subject: subject,
+          Who_Id: leadId,
+          Due_Date: new Date(
+            Date.now() + (process.env.TASK_DUE_HOURS || 24) * 60 * 60 * 1000
+          )
+            .toISOString()
+            .split("T")[0],
+          Status: "Not Started"
+        }
+      ]
     })
   });
 }
@@ -76,4 +91,6 @@ app.post("/incoming-call", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`🚀 Server running on port ${PORT}`)
+);
