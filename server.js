@@ -90,6 +90,101 @@ app.post("/incoming-call", async (req, res) => {
     res.status(500).send({ error: "Internal Server Error" });
   }
 });
+// =============================
+// Dispatch Call API
+// =============================
+
+// Helper: Create Lead in Zoho CRM
+async function createZohoLead(name, phone, productLine) {
+    try {
+        const response = await fetch(`${process.env.ZOHO_BASE_URL}/crm/v2/Leads`, {
+            method: "POST",
+            headers: {
+                "Authorization": `Zoho-oauthtoken ${process.env.ZOHO_ACCESS_TOKEN}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                data: [{
+                    Last_Name: name || "Incoming Lead",
+                    Phone: phone,
+                    Product_Line: productLine || "General Inquiry",
+                    Lead_Source: "Incoming Call"
+                }]
+            })
+        });
+
+        const data = await response.json();
+        if (data.data && data.data[0].code === "SUCCESS") {
+            return data.data[0].details.id; // Lead ID
+        } else {
+            console.error("Zoho Lead creation failed:", data);
+            throw new Error("Failed to create lead");
+        }
+    } catch (err) {
+        console.error("Error in createZohoLead:", err);
+        throw err;
+    }
+}
+
+// Helper: Create Follow-up Task
+async function createZohoTask(leadId) {
+    try {
+        const dueTime = new Date();
+        dueTime.setHours(dueTime.getHours() + (parseInt(process.env.TASK_DUE_HOURS) || 2));
+
+        const response = await fetch(`${process.env.ZOHO_BASE_URL}/crm/v2/Tasks`, {
+            method: "POST",
+            headers: {
+                "Authorization": `Zoho-oauthtoken ${process.env.ZOHO_ACCESS_TOKEN}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                data: [{
+                    Subject: "Follow up on incoming call",
+                    Due_Date: dueTime.toISOString().split("T")[0],
+                    What_Id: leadId // link to lead
+                }]
+            })
+        });
+
+        const data = await response.json();
+        if (data.data && data.data[0].code === "SUCCESS") {
+            return data.data[0].details.id; // Task ID
+        } else {
+            console.error("Zoho Task creation failed:", data);
+            throw new Error("Failed to create task");
+        }
+    } catch (err) {
+        console.error("Error in createZohoTask:", err);
+        throw err;
+    }
+}
+
+// Route: Dispatch Call
+app.post("/api/dispatch-call", async (req, res) => {
+    const { name, phone, product_line } = req.body;
+
+    if (!phone) {
+        return res.status(400).json({ success: false, message: "Phone number is required" });
+    }
+
+    try {
+        // 1. Create lead
+        const leadId = await createZohoLead(name, phone, product_line);
+
+        // 2. Create follow-up task
+        const taskId = await createZohoTask(leadId);
+
+        res.json({
+            success: true,
+            message: "Lead and follow-up task created successfully",
+            leadId,
+            taskId
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
 
 app.listen(PORT, () =>
   console.log(`🚀 Server running on port ${PORT}`)
