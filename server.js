@@ -8,10 +8,11 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
+// Health check
 app.get("/", (req, res) => res.send("✅ Omni-Zoho Automation Server is running!"));
 app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-// ----- Zoho helper (native fetch) -----
+// ----- Helper for Zoho API calls -----
 async function zoho(path, { method = "GET", body } = {}) {
   const base = (process.env.ZOHO_BASE_URL || "").replace(/\/+$/, "");
   const url = `${base}${path}`;
@@ -35,12 +36,11 @@ async function zoho(path, { method = "GET", body } = {}) {
 
 // ----- Lead: find by phone or create -----
 async function findOrCreateLead({ name, phone, product_line }) {
-  // Search first
   try {
     const search = await zoho(`/crm/v2/Leads/search?phone=${encodeURIComponent(phone)}`);
     if (search?.data?.length) return search.data[0].id;
   } catch {
-    // 204/400 etc – ignore and create new
+    // ignore if not found
   }
 
   const payload = {
@@ -86,16 +86,50 @@ async function createTask(leadId) {
   throw new Error(`Task create failed: ${JSON.stringify(out)}`);
 }
 
-// ----- Dispatch endpoint -----
+// ----- Zoho Voice: Dispatch Call -----
+async function dispatchZohoCall({ to, from, caller_id }) {
+  const url = "https://www.zohoapis.in/voice/v1/calls"; // India DC
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Zoho-oauthtoken ${process.env.ZOHO_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      to,
+      from,
+      caller_id
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Dispatch failed: ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+// ----- Main API endpoint -----
 app.post("/api/dispatch-call", async (req, res) => {
   try {
     const { name, phone, product_line } = req.body || {};
     if (!phone) return res.status(400).json({ success: false, message: "phone is required" });
 
+    // Step 1: Find or create lead
     const leadId = await findOrCreateLead({ name, phone, product_line });
+
+    // Step 2: Create follow-up task
     const taskId = await createTask(leadId);
 
-    res.json({ success: true, leadId, taskId });
+    // Step 3: Dispatch call via Zoho Voice
+    const callResponse = await dispatchZohoCall({
+      to: phone,
+      from: process.env.ZOHO_CALLER_NUMBER,
+      caller_id: "Lead Followup"
+    });
+
+    res.json({ success: true, leadId, taskId, callResponse });
   } catch (err) {
     console.error("Dispatch error:", err);
     res.status(500).json({ success: false, message: err.message });
