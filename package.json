@@ -1,13 +1,14 @@
 {
-  "name": "omni-zoho-project",
+  "name": "zoho-dispatch-server",
   "version": "1.0.0",
-  "type": "module",
+  "description": "Minimal server to create Zoho Leads & Tasks via /api/dispatch-call with auto refresh-token.",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.x"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

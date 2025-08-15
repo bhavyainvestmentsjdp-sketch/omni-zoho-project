@@ -8,51 +8,77 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Health check
-app.get("/", (req, res) => res.send("✅ Omni-Zoho Automation Server is running!"));
-app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+let accessToken = null;
+let tokenExpiry = 0; // epoch ms
 
-// ----- Helper for Zoho API calls -----
+// Fetch a fresh access token using refresh token
+async function getAccessToken() {
+  const now = Date.now();
+  if (accessToken && now < tokenExpiry - 60_000) {
+    return accessToken; // reuse until 60s before expiry
+  }
+
+  const tokenUrl = `https://accounts.zoho.${process.env.ZOHO_DOMAIN || "in"}/oauth/v2/token`;
+  const body = new URLSearchParams({
+    refresh_token: process.env.ZOHO_REFRESH_TOKEN,
+    client_id: process.env.ZOHO_CLIENT_ID,
+    client_secret: process.env.ZOHO_CLIENT_SECRET,
+    grant_type: "refresh_token"
+  });
+
+  const res = await fetch(tokenUrl, { method: "POST", body });
+  const data = await res.json().catch(() => ({}));
+
+  if (!res.ok || !data.access_token) {
+    throw new Error(`Failed to get access token: ${res.status} ${JSON.stringify(data)}`);
+  }
+
+  accessToken = data.access_token;
+  // Zoho tokens generally valid ~1 hour. Set expiry conservatively to 55 minutes.
+  tokenExpiry = now + 55 * 60 * 1000;
+  return accessToken;
+}
+
+// Minimal Zoho API wrapper
 async function zoho(path, { method = "GET", body } = {}) {
-  const base = (process.env.ZOHO_BASE_URL || "").replace(/\/+$/, "");
+  const token = await getAccessToken();
+  const base = (process.env.ZOHO_BASE_URL || "https://www.zohoapis.in").replace(/\/+$/, "");
   const url = `${base}${path}`;
 
   const res = await fetch(url, {
     method,
     headers: {
-      Authorization: `Zoho-oauthtoken ${process.env.ZOHO_ACCESS_TOKEN}`,
-      "Content-Type": "application/json",
+      Authorization: `Zoho-oauthtoken ${token}`,
+      "Content-Type": "application/json"
     },
-    body: body ? JSON.stringify(body) : undefined,
+    body: body ? JSON.stringify(body) : undefined
   });
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const msg = data?.message || data?.error || JSON.stringify(data);
-    throw new Error(`Zoho ${res.status}: ${msg}`);
+    throw new Error(`Zoho ${res.status}: ${JSON.stringify(data)}`);
   }
   return data;
 }
 
-// ----- Lead: find by phone or create -----
+// Search lead by phone or create
 async function findOrCreateLead({ name, phone, product_line }) {
+  // Try search
   try {
     const search = await zoho(`/crm/v2/Leads/search?phone=${encodeURIComponent(phone)}`);
     if (search?.data?.length) return search.data[0].id;
-  } catch {
-    // ignore if not found
+  } catch (e) {
+    // ignore search failures (204, 400 etc.) and create fresh
   }
 
   const payload = {
-    data: [
-      {
-        Last_Name: name || "Incoming Lead",
-        Phone: phone,
-        Company: "Unknown",
-        Lead_Source: "Incoming Call",
-        ...(product_line ? { Product_Line: product_line } : {}),
-      },
-    ],
+    data: [{
+      Last_Name: name || "Incoming Lead",
+      Phone: phone,
+      Company: "Unknown",
+      Lead_Source: "Incoming Call",
+      ...(product_line ? { Product_Line: product_line } : {})
+    }]
   };
 
   const created = await zoho("/crm/v2/Leads", { method: "POST", body: payload });
@@ -62,21 +88,19 @@ async function findOrCreateLead({ name, phone, product_line }) {
   throw new Error(`Lead create failed: ${JSON.stringify(created)}`);
 }
 
-// ----- Task create -----
+// Create follow-up Task linked to the Lead
 async function createTask(leadId) {
   const due = new Date();
   const hours = Number(process.env.TASK_DUE_HOURS || 24);
   due.setHours(due.getHours() + hours);
 
   const payload = {
-    data: [
-      {
-        Subject: "Follow up on incoming call",
-        Who_Id: leadId,
-        Status: "Not Started",
-        Due_Date: due.toISOString().split("T")[0],
-      },
-    ],
+    data: [{
+      Subject: "Follow up on incoming call",
+      Who_Id: leadId,
+      Status: "Not Started",
+      Due_Date: due.toISOString().split("T")[0]
+    }]
   };
 
   const out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
@@ -86,54 +110,28 @@ async function createTask(leadId) {
   throw new Error(`Task create failed: ${JSON.stringify(out)}`);
 }
 
-// ----- Zoho Voice: Dispatch Call -----
-async function dispatchZohoCall({ to, from, caller_id }) {
-  const url = "https://www.zohoapis.in/voice/v1/calls"; // India DC
+// Health checks
+app.get("/", (req, res) => res.send("✅ Omni-Zoho Dispatch Server is running!"));
+app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Zoho-oauthtoken ${process.env.ZOHO_ACCESS_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      to,
-      from,
-      caller_id
-    }),
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(`Dispatch failed: ${JSON.stringify(data)}`);
-  }
-  return data;
-}
-
-// ----- Main API endpoint -----
+// Main endpoint: creates/updates lead and adds follow-up task
 app.post("/api/dispatch-call", async (req, res) => {
   try {
     const { name, phone, product_line } = req.body || {};
-    if (!phone) return res.status(400).json({ success: false, message: "phone is required" });
+    if (!phone) {
+      return res.status(400).json({ success: false, message: "phone is required" });
+    }
 
-    // Step 1: Find or create lead
     const leadId = await findOrCreateLead({ name, phone, product_line });
-
-    // Step 2: Create follow-up task
     const taskId = await createTask(leadId);
 
-    // Step 3: Dispatch call via Zoho Voice
-    const callResponse = await dispatchZohoCall({
-      to: phone,
-      from: process.env.ZOHO_CALLER_NUMBER,
-      caller_id: "Lead Followup"
-    });
-
-    res.json({ success: true, leadId, taskId, callResponse });
+    res.json({ success: true, leadId, taskId });
   } catch (err) {
     console.error("Dispatch error:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server listening on ${PORT}`);
+});
