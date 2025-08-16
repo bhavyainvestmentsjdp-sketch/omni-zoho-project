@@ -9,6 +9,33 @@ require("dotenv").config();
 
 const app = express();
 app.use(express.json());
+// CORS
+const cors = require("cors");
+
+// comma-separated env var → allowlist
+const ALLOW_ORIGINS =
+  (process.env.ALLOW_ORIGINS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+
+// Helpful for proxies/CDN
+app.use((req, res, next) => { res.setHeader("Vary", "Origin"); next(); });
+
+app.use(cors({
+  origin(origin, cb) {
+    // Postman/cURL जैसी no-origin requests allow
+    if (!origin) return cb(null, true);
+    // Only allow listed origins
+    if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error("Not allowed by CORS: " + origin));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
+
+// Preflight
+app.options("*", cors());
 
 const PORT = process.env.PORT || 3000;
 const DUE_HOURS = Number(process.env.TASK_DUE_HOURS || 24);
