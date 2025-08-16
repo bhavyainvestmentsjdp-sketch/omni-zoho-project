@@ -20,14 +20,17 @@ const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS || "")
 app.use((req, res, next) => { res.setHeader("Vary", "Origin"); next(); });
 
 app.use(cors({
-  origin(origin, cb) => {
-    if (!origin) return cb(null, true);              // Postman / no-origin
+  origin: (origin, cb) => {     // ✅ सही: colon + arrow function
+    // Postman / no-origin allow
+    if (!origin) return cb(null, true);
+    // allow-list
     if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS: " + origin));
   },
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
+
 app.options("*", cors());
 
 const PORT = process.env.PORT || 3000;
