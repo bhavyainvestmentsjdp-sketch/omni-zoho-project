@@ -217,6 +217,45 @@ app.post("/api/dispatch-call", async (req, res) => {
 
     const leadId = await findOrCreateLead({ name, phone, product_line });
     const taskId = await createTask(leadId);
+// --- Omni outbound call config ---
+const OMNI = {
+  base: process.env.OMNI_BASE_URL || "https://api.omnidimension.ai",
+  startPath: process.env.OMNI_CALLS_START_PATH || "/calls/start",
+  apiKey: process.env.OMNIDIM_API_KEY,
+  agentId: process.env.OMNIDIM_AGENT_ID,
+};
+function assertOmniReady() {
+  if (!OMNI.apiKey || !OMNI.agentId) {
+    throw new Error("Omni config missing: OMNIDIM_API_KEY or OMNIDIM_AGENT_ID");
+  }
+}
+
+// Start a call via Omni provider
+async function startOmniCall({ to, leadId, taskId, name }) {
+  assertOmniReady();
+
+  const url = `${OMNI.base}${OMNI.startPath}`;
+  const body = {
+    agent_id: OMNI.agentId,
+    to,                         // E.164 or your provider’s expected format
+    metadata: { leadId, taskId, name }
+  };
+
+  const res = await axios.post(url, body, {
+    headers: {
+      Authorization: `Bearer ${OMNI.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    validateStatus: () => true,
+  });
+
+  if (res.status >= 200 && res.status < 300) return res.data;
+
+  const err = new Error(`Omni call failed ${res.status}`);
+  err.status = res.status;
+  err.body = res.data;
+  throw err;
+}
 
     return res.json({ success: true, leadId, taskId });
   } catch (err) {
