@@ -7,70 +7,193 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const BASE = "https://www.zohoapis.in";
 const DUE_HOURS = Number(process.env.TASK_DUE_HOURS || 24);
 
-// Access Token (via Refresh Token)
-async function getAccessToken() {
-  const url = `https://accounts.zoho.in/oauth/v2/token`;
-  const params = {
-    refresh_token: process.env.ZOHO_REFRESH_TOKEN,
+// ---- Endpoints (env override supported) ----
+const ACCOUNTS = (() => {
+  const v = process.env.ZOHO_ACCESS_TOKEN_URL;
+  if (v) {
+    try { return new URL(v).origin; } catch { return String(v).replace(/\/oauth\/v2\/token.*$/,''); }
+  }
+  return "https://accounts.zoho.in";
+})();
+
+const APIS = (() => {
+  const v = process.env.ZOHO_BASE_URL;
+  if (v) {
+    try { return new URL(v).origin; } catch { return String(v); }
+  }
+  return "https://www.zohoapis.in";
+})();
+
+// ---- Token cache ----
+let TOKEN_CACHE = { token: null, expiry: 0 };
+const tokenValid = () => TOKEN_CACHE.token && Date.now() < TOKEN_CACHE.expiry - 60_000;
+
+async function refreshAccessToken() {
+  const form = new URLSearchParams({
+    grant_type: "refresh_token",
     client_id: process.env.ZOHO_CLIENT_ID,
     client_secret: process.env.ZOHO_CLIENT_SECRET,
-    grant_type: "refresh_token",
-  };
-  try {
-    const res = await axios.post(url, null, { params });
-    if (!res.data.access_token) throw new Error("No access_token in response");
-    return res.data.access_token;
-  } catch (err) {
-    const detail = err.response?.data || err.message;
-    console.error("Error fetching Zoho Access Token:", detail);
-    throw new Error("Zoho token error");
+    refresh_token: process.env.ZOHO_REFRESH_TOKEN,
+  });
+
+  const res = await axios.post(`${ACCOUNTS}/oauth/v2/token`, form.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    validateStatus: () => true,
+  });
+
+  if (res.status !== 200 || !res.data?.access_token) {
+    const detail = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
+    const err = new Error(`Refresh failed ${res.status}: ${detail}`);
+    err.status = res.status;
+    err.body = res.data;
+    throw err;
   }
+
+  const { access_token, expires_in } = res.data;
+  TOKEN_CACHE.token = access_token;
+  TOKEN_CACHE.expiry = Date.now() + Number(expires_in || 3600) * 1000;
+  return TOKEN_CACHE.token;
 }
 
-// Zoho API helper
+async function getAccessToken(force = false) {
+  if (!force && tokenValid()) return TOKEN_CACHE.token;
+  return refreshAccessToken();
+}
+
+// ---- Generic Zoho caller (auto-refresh on 401/INVALID_TOKEN) ----
 async function zoho(path, { method = "GET", body } = {}) {
-  const token = await getAccessToken();
-  const url = `${BASE}${path}`;
-  try {
-    const res = await axios({
-      url,
-      method,
-      headers: {
-        Authorization: `Zoho-oauthtoken ${token}`,
-        "Content-Type": "application/json",
-      },
-      data: body ? JSON.stringify(body) : undefined,
-    });
-    return res.data;
-  } catch (err) {
-    const detail = err.response?.data || err.message;
-    console.error("Zoho API error:", detail);
-    throw new Error(
-      typeof detail === "string" ? detail : JSON.stringify(detail)
-    );
+  let token = await getAccessToken();
+  const url = `${APIS}${path}`;
+
+  const call = () => axios({
+    url,
+    method,
+    headers: {
+      Authorization: `Zoho-oauthtoken ${token}`, // NOTE: not "Bearer"
+      "Content-Type": "application/json",
+    },
+    data: body ? JSON.stringify(body) : undefined,
+    validateStatus: () => true,
+  });
+
+  let res = await call();
+
+  const invalid =
+    res.status === 401 ||
+    res?.data?.code === "INVALID_TOKEN" ||
+    res?.data?.message === "INVALID_TOKEN";
+
+  if (invalid) {
+    token = await getAccessToken(true);
+    res = await call();
   }
+
+  if (res.status < 200 || res.status >= 300) {
+    const err = new Error(`Zoho CRM ${res.status}`);
+    err.status = res.status;
+    err.body = res.data;
+    throw err;
+  }
+  return res.data;
 }
 
-// Lead find/create
+// ---- Lead find/create ----
 async function findOrCreateLead({ name, phone, product_line }) {
+  let leadId = null;
+
+  // Reliable search by criteria
   try {
     const search = await zoho(
-      `/crm/v2/Leads/search?phone=${encodeURIComponent(phone)}`
+      `/crm/v2/Leads/search?criteria=(Phone:equals:${encodeURIComponent(phone)})`
     );
-    if (search?.data?.length) return search.data[0].id;
-  } catch (_) {}
+    if (search?.data?.length) leadId = search.data[0].id;
+  } catch (_) {
+    // 204/NOT_FOUND etc → ignore and create
+  }
+  if (leadId) return leadId;
+
+  // In case your custom field API name differs, allow override:
+  const productField = process.env.ZOHO_LEAD_PRODUCT_FIELD || "Product_Line";
+
+  const record = {
+    Last_Name: name || "Incoming Lead",
+    Phone: phone,
+    Company: "Unknown",
+    Lead_Source: "Incoming Call",
+  };
+  if (product_line) record[productField] = product_line;
+
+  const created = await zoho("/crm/v2/Leads", { method: "POST", body: { data: [record] } });
+  const row = created?.data?.[0];
+  if (row?.code === "SUCCESS") return row.details.id;
+
+  const err = new Error("Lead create failed");
+  err.status = 422;
+  err.body = created;
+  throw err;
+}
+
+// ---- Task create (link to Lead via Who_Id) ----
+async function createTask(leadId) {
+  if (!leadId || typeof leadId !== "string") {
+    throw Object.assign(new Error(`Invalid leadId: ${leadId}`), { status: 400 });
+  }
+
+  const due = new Date();
+  due.setHours(due.getHours() + DUE_HOURS);
+
   const payload = {
     data: [
       {
-        Last_Name: name || "Incoming Lead",
-        Phone: phone,
-        Company: "Unknown",
-        Lead_Source: "Incoming Call",
-        ...(product_line ? { Product_Line: product_line } : {}),
+        Subject: "Follow up on incoming call",
+        Status: "Not Started",
+        Who_Id: { id: leadId }, // IMPORTANT: object form, not plain string
+        Due_Date: due.toISOString().split("T")[0], // YYYY-MM-DD
       },
     ],
   };
-  const created = await zoho("/crm/v2/Leads", { method:
+
+  const out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
+  const row = out?.data?.[0];
+  if (row?.code === "SUCCESS") return row.details.id;
+
+  const err = new Error("Task create failed");
+  err.status = 422;
+  err.body = out;
+  throw err;
+}
+
+// ---- Routes ----
+app.get("/", (_req, res) =>
+  res.send("✅ Omni–Zoho Dispatch Server (India DC) is running!")
+);
+
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, time: new Date().toISOString() })
+);
+
+app.post("/api/dispatch-call", async (req, res) => {
+  try {
+    const { name, phone, product_line } = req.body || {};
+    if (!phone) {
+      return res.status(400).json({ success: false, message: "phone is required" });
+    }
+
+    const leadId = await findOrCreateLead({ name, phone, product_line });
+    const taskId = await createTask(leadId);
+
+    return res.json({ success: true, leadId, taskId });
+  } catch (err) {
+    const status = err.status || err.response?.status || 500;
+    console.error("ERROR:", status, err.body || err.response?.data || err.message);
+    return res.status(status).json({
+      success: false,
+      message: err.message || "Internal error",
+      zoho: err.body || err.response?.data || null, // shows full Zoho error JSON to Postman
+    });
+  }
+});
+
+app.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
