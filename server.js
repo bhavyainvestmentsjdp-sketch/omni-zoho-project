@@ -138,7 +138,7 @@ async function findOrCreateLead({ name, phone, product_line }) {
   throw err;
 }
 
-// ---- Task create (try Who_Id, fallback to What_Id) ----
+// ---- Task create (try Who_Id → What_Id → What_Id+se_module; finally unlinked task) ----
 async function createTask(leadId) {
   if (!leadId || typeof leadId !== "string" || leadId.length < 15) {
     throw Object.assign(new Error(`Invalid leadId: ${leadId}`), { status: 400 });
@@ -163,18 +163,43 @@ async function createTask(leadId) {
     d => d?.details?.api_name === "Who_Id" || d?.message?.includes?.("Who")
   );
 
-  // 2) If Who_Id rejected, try What_Id (some orgs disallow Leads on Who_Id)
+  // 2) Try What_Id (some orgs prefer Related To)
   if (whoErr) {
     payload = { data: [ { ...base, What_Id: { id: leadId } } ] };
-    const out2 = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
-    const row2 = out2?.data?.[0];
-    if (row2?.code === "SUCCESS") return row2.details.id;
-
-    const err2 = new Error("Task create failed (Who_Id & What_Id both rejected)");
-    err2.status = 422;
-    err2.body = { first: out, second: out2 };
-    throw err2;
+    out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
+    row = out?.data?.[0];
+    if (row?.code === "SUCCESS") return row.details.id;
   }
+
+  const whatErr = Array.isArray(out?.data) && out.data.some(
+    d => d?.details?.api_name === "What_Id" || d?.message?.includes?.("What")
+  );
+
+  // 3) Try What_Id with se_module = Leads (कुछ orgs में जरूरी)
+  if (whoErr || whatErr) {
+    payload = { data: [ { ...base, What_Id: { id: leadId }, se_module: "Leads" } ] };
+    out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
+    row = out?.data?.[0];
+    if (row?.code === "SUCCESS") return row.details.id;
+  }
+
+  // 4) Final fallback: Unlinked task, but keep a trace
+  const fallback = {
+    ...base,
+    Description: `LeadId: ${leadId} (linking failed via Who_Id/What_Id)`,
+  };
+  const outFinal = await zoho("/crm/v2/Tasks", { method: "POST", body: { data: [fallback] } });
+  const rowFinal = outFinal?.data?.[0];
+  if (rowFinal?.code === "SUCCESS") {
+    // आप चाहें तो response में बताएं कि task unlinked है
+    return rowFinal.details.id;
+  }
+
+  const err = new Error("Task create failed (Who_Id, What_Id, se_module tried)");
+  err.status = 422;
+  err.body = { first: out, final: outFinal };
+  throw err;
+}
 
   const err = new Error("Task create failed");
   err.status = 422;
