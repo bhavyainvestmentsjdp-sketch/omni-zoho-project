@@ -5,28 +5,23 @@ process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
 /* ✅ Omni–Zoho Dispatch Server (India DC) */
 const express = require("express");
 const axios = require("axios");
+const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
 app.use(express.json());
-// CORS
-const cors = require("cors");
 
-// comma-separated env var → allowlist
-const ALLOW_ORIGINS =
-  (process.env.ALLOW_ORIGINS || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
+// -------- CORS (allow only your domains) --------
+const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
-// Helpful for proxies/CDN
 app.use((req, res, next) => { res.setHeader("Vary", "Origin"); next(); });
 
 app.use(cors({
   origin(origin, cb) {
-    // Postman/cURL जैसी no-origin requests allow
-    if (!origin) return cb(null, true);
-    // Only allow listed origins
+    if (!origin) return cb(null, true);                   // Postman/cURL
     if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS: " + origin));
   },
@@ -34,13 +29,12 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
 
-// Preflight
-app.options("*", cors());
+app.options("*", cors()); // preflight
 
 const PORT = process.env.PORT || 3000;
 const DUE_HOURS = Number(process.env.TASK_DUE_HOURS || 24);
 
-/* ---- Endpoints (env override supported) ---- */
+// -------- Zoho domains (env override supported) --------
 const ACCOUNTS = (() => {
   const v = process.env.ZOHO_ACCESS_TOKEN_URL;
   if (v) {
@@ -57,7 +51,38 @@ const APIS = (() => {
   return "https://www.zohoapis.in"; // India DC
 })();
 
-/* ---- Token cache ---- */
+// -------- Omni config (top-level) --------
+const OMNI = {
+  base: process.env.OMNI_BASE_URL || "https://api.omnidimension.ai",
+  startPath: process.env.OMNI_CALLS_START_PATH || "/calls/start",
+  apiKey: process.env.OMNIDIM_API_KEY,
+  agentId: process.env.OMNIDIM_AGENT_ID,
+  callOnCreate: String(process.env.OMNI_CALL_ON_CREATE || "false").toLowerCase() === "true",
+};
+function assertOmniReady() {
+  if (!OMNI.apiKey || !OMNI.agentId) {
+    throw new Error("Omni config missing: OMNIDIM_API_KEY or OMNIDIM_AGENT_ID");
+  }
+}
+async function startOmniCall({ to, leadId, taskId, name }) {
+  assertOmniReady();
+  const url = `${OMNI.base}${OMNI.startPath}`;
+  const body = { agent_id: OMNI.agentId, to, metadata: { leadId, taskId, name } };
+
+  const res = await axios.post(url, body, {
+    headers: { Authorization: `Bearer ${OMNI.apiKey}`, "Content-Type": "application/json" },
+    validateStatus: () => true,
+  });
+
+  if (res.status >= 200 && res.status < 300) return res.data;
+
+  const err = new Error(`Omni call failed ${res.status}`);
+  err.status = res.status;
+  err.body = res.data;
+  throw err;
+}
+
+// -------- Token cache --------
 let TOKEN_CACHE = { token: null, expiry: 0 };
 const tokenValid = () => TOKEN_CACHE.token && Date.now() < TOKEN_CACHE.expiry - 60_000;
 
@@ -87,13 +112,12 @@ async function refreshAccessToken() {
   TOKEN_CACHE.expiry = Date.now() + Number(expires_in || 3600) * 1000;
   return TOKEN_CACHE.token;
 }
-
 async function getAccessToken(force = false) {
   if (!force && tokenValid()) return TOKEN_CACHE.token;
   return refreshAccessToken();
 }
 
-/* ---- Generic Zoho caller (auto-refresh on 401/INVALID_TOKEN) ---- */
+// -------- Zoho generic caller --------
 async function zoho(path, { method = "GET", body } = {}) {
   let token = await getAccessToken();
   const url = `${APIS}${path}`;
@@ -102,7 +126,7 @@ async function zoho(path, { method = "GET", body } = {}) {
     url,
     method,
     headers: {
-      Authorization: `Zoho-oauthtoken ${token}`, // NOTE: not "Bearer"
+      Authorization: `Zoho-oauthtoken ${token}`,   // NOTE: not "Bearer"
       "Content-Type": "application/json",
     },
     data: body ? JSON.stringify(body) : undefined,
@@ -130,24 +154,20 @@ async function zoho(path, { method = "GET", body } = {}) {
   return res.data;
 }
 
-/* ---- Lead find/create ---- */
+// -------- Lead find/create --------
 async function findOrCreateLead({ name, phone, product_line }) {
   let leadId = null;
 
-  // Reliable search by criteria (phone param can be finicky)
   try {
     const search = await zoho(
       `/crm/v2/Leads/search?criteria=(Phone:equals:${encodeURIComponent(phone)})`
     );
     if (search?.data?.length) leadId = search.data[0].id;
-  } catch (_) {
-    // 204/NOT_FOUND or 400 → ignore & create
-  }
+  } catch (_) { /* ignore */ }
+
   if (leadId) return leadId;
 
-  // Allow custom API name via env if Product_Line differs in your org
   const productField = process.env.ZOHO_LEAD_PRODUCT_FIELD || "Product_Line";
-
   const record = {
     Last_Name: name || "Incoming Lead",
     Phone: phone,
@@ -166,22 +186,20 @@ async function findOrCreateLead({ name, phone, product_line }) {
   throw err;
 }
 
-/* ---- Task create (Who_Id → What_Id → What_Id+se_module → Unlinked) ---- */
+// -------- Task create with fallbacks --------
 async function createTask(leadId) {
   if (!leadId || typeof leadId !== "string" || leadId.length < 15) {
     throw Object.assign(new Error(`Invalid leadId: ${leadId}`), { status: 400 });
   }
 
-  const due = new Date();
-  due.setHours(due.getHours() + DUE_HOURS);
-
+  const due = new Date(); due.setHours(due.getHours() + DUE_HOURS);
   const base = {
     Subject: "Follow up on incoming call",
     Status: "Not Started",
-    Due_Date: due.toISOString().split("T")[0], // YYYY-MM-DD
+    Due_Date: due.toISOString().split("T")[0],
   };
 
-  // 1) Try Who_Id (Lead/Contact)
+  // 1) Who_Id (Lead/Contact)
   let payload = { data: [ { ...base, Who_Id: { id: leadId } } ] };
   let out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
   let row = out?.data?.[0];
@@ -191,7 +209,7 @@ async function createTask(leadId) {
     (d) => d?.details?.api_name === "Who_Id" || d?.message?.includes?.("Who")
   );
 
-  // 2) If Who_Id rejected, try What_Id (Related To)
+  // 2) What_Id (Related To)
   if (whoErr) {
     payload = { data: [ { ...base, What_Id: { id: leadId } } ] };
     out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
@@ -203,7 +221,7 @@ async function createTask(leadId) {
     (d) => d?.details?.api_name === "What_Id" || d?.message?.includes?.("What")
   );
 
-  // 3) Try What_Id + se_module = Leads (some orgs require this)
+  // 3) What_Id + se_module
   if (whoErr || whatErr) {
     payload = { data: [ { ...base, What_Id: { id: leadId }, se_module: "Leads" } ] };
     out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
@@ -211,11 +229,8 @@ async function createTask(leadId) {
     if (row?.code === "SUCCESS") return row.details.id;
   }
 
-  // 4) Final fallback: create unlinked task so workflow continues
-  const fallback = {
-    ...base,
-    Description: `LeadId: ${leadId} (linking failed via Who_Id/What_Id)`,
-  };
+  // 4) Unlinked fallback
+  const fallback = { ...base, Description: `LeadId: ${leadId} (linking failed via Who_Id/What_Id)` };
   const outFinal = await zoho("/crm/v2/Tasks", { method: "POST", body: { data: [fallback] } });
   const rowFinal = outFinal?.data?.[0];
   if (rowFinal?.code === "SUCCESS") return rowFinal.details.id;
@@ -226,65 +241,35 @@ async function createTask(leadId) {
   throw err;
 }
 
-/* ---- Routes ---- */
-app.get("/", (_req, res) =>
-  res.send("✅ Omni–Zoho Dispatch Server (India DC) is running!")
-);
+// -------- Helpers --------
+function toE164(raw) {
+  let s = String(raw || "").replace(/[^\d+]/g, "");
+  if (/^0\d{10}$/.test(s)) s = s.slice(1);
+  if (/^\d{10}$/.test(s)) return "+91" + s;
+  if (/^\+?\d{10,15}$/.test(s)) return s.startsWith("+") ? s : "+" + s;
+  return s; // as-is (provider may handle)
+}
 
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, time: new Date().toISOString() })
-);
+// -------- Routes --------
+app.get("/", (_req, res) => res.send("✅ Omni–Zoho Dispatch Server (India DC) is running!"));
+app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
+// Create lead + task (+ optional auto call)
 app.post("/api/dispatch-call", async (req, res) => {
   try {
     const { name, phone, product_line } = req.body || {};
-    if (!phone) {
-      return res.status(400).json({ success: false, message: "phone is required" });
-    }
+    if (!phone) return res.status(400).json({ success: false, message: "phone is required" });
 
     const leadId = await findOrCreateLead({ name, phone, product_line });
     const taskId = await createTask(leadId);
-// --- Omni outbound call config ---
-const OMNI = {
-  base: process.env.OMNI_BASE_URL || "https://api.omnidimension.ai",
-  startPath: process.env.OMNI_CALLS_START_PATH || "/calls/start",
-  apiKey: process.env.OMNIDIM_API_KEY,
-  agentId: process.env.OMNIDIM_AGENT_ID,
-};
-function assertOmniReady() {
-  if (!OMNI.apiKey || !OMNI.agentId) {
-    throw new Error("Omni config missing: OMNIDIM_API_KEY or OMNIDIM_AGENT_ID");
-  }
-}
 
-// Start a call via Omni provider
-async function startOmniCall({ to, leadId, taskId, name }) {
-  assertOmniReady();
+    let callResult = null, callError = null;
+    if (OMNI.callOnCreate) {
+      try { callResult = await startOmniCall({ to: toE164(phone), leadId, taskId, name }); }
+      catch (e) { callError = { status: e.status || 500, body: e.body || e.message }; }
+    }
 
-  const url = `${OMNI.base}${OMNI.startPath}`;
-  const body = {
-    agent_id: OMNI.agentId,
-    to,                         // E.164 or your provider’s expected format
-    metadata: { leadId, taskId, name }
-  };
-
-  const res = await axios.post(url, body, {
-    headers: {
-      Authorization: `Bearer ${OMNI.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    validateStatus: () => true,
-  });
-
-  if (res.status >= 200 && res.status < 300) return res.data;
-
-  const err = new Error(`Omni call failed ${res.status}`);
-  err.status = res.status;
-  err.body = res.data;
-  throw err;
-}
-
-    return res.json({ success: true, leadId, taskId });
+    return res.json({ success: true, leadId, taskId, callResult, callError });
   } catch (err) {
     const status = err.status || err.response?.status || 500;
     console.error("ERROR:", status, err.body || err.response?.data || err.message);
@@ -296,7 +281,21 @@ async function startOmniCall({ to, leadId, taskId, name }) {
   }
 });
 
-/* ---- Start server (bind 0.0.0.0 for Render) ---- */
+// Direct call trigger (for “Call me” buttons)
+app.post("/api/call-now", async (req, res) => {
+  try {
+    const { name, phone } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, message: "phone is required" });
+    const result = await startOmniCall({ to: toE164(phone), leadId: null, taskId: null, name });
+    return res.json({ success: true, result });
+  } catch (err) {
+    const status = err.status || err.response?.status || 500;
+    console.error("CALL_NOW ERROR:", status, err.body || err.response?.data || err.message);
+    return res.status(status).json({ success: false, message: err.message, details: err.body || null });
+  }
+});
+
+/* ---- Start server ---- */
 app.listen(PORT, "0.0.0.0", () => {
   console.log("🚀 Server listening on", PORT);
   console.log("Zoho ACCOUNTS:", ACCOUNTS, "APIS:", APIS);
