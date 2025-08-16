@@ -1,7 +1,8 @@
+// Top-level crash logs (so 502/crashes show a reason)
 process.on("unhandledRejection", (r) => console.error("UNHANDLED_REJECTION", r));
 process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
 
-// ✅ Omni–Zoho Dispatch Server (India DC)
+/* ✅ Omni–Zoho Dispatch Server (India DC) */
 const express = require("express");
 const axios = require("axios");
 require("dotenv").config();
@@ -12,13 +13,13 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const DUE_HOURS = Number(process.env.TASK_DUE_HOURS || 24);
 
-// ---- Endpoints (env override supported) ----
+/* ---- Endpoints (env override supported) ---- */
 const ACCOUNTS = (() => {
   const v = process.env.ZOHO_ACCESS_TOKEN_URL;
   if (v) {
     try { return new URL(v).origin; } catch { return String(v).replace(/\/oauth\/v2\/token.*$/,''); }
   }
-  return "https://accounts.zoho.in";
+  return "https://accounts.zoho.in"; // India DC
 })();
 
 const APIS = (() => {
@@ -26,10 +27,10 @@ const APIS = (() => {
   if (v) {
     try { return new URL(v).origin; } catch { return String(v); }
   }
-  return "https://www.zohoapis.in";
+  return "https://www.zohoapis.in"; // India DC
 })();
 
-// ---- Token cache ----
+/* ---- Token cache ---- */
 let TOKEN_CACHE = { token: null, expiry: 0 };
 const tokenValid = () => TOKEN_CACHE.token && Date.now() < TOKEN_CACHE.expiry - 60_000;
 
@@ -65,7 +66,7 @@ async function getAccessToken(force = false) {
   return refreshAccessToken();
 }
 
-// ---- Generic Zoho caller (auto-refresh on 401/INVALID_TOKEN) ----
+/* ---- Generic Zoho caller (auto-refresh on 401/INVALID_TOKEN) ---- */
 async function zoho(path, { method = "GET", body } = {}) {
   let token = await getAccessToken();
   const url = `${APIS}${path}`;
@@ -102,22 +103,22 @@ async function zoho(path, { method = "GET", body } = {}) {
   return res.data;
 }
 
-// ---- Lead find/create ----
+/* ---- Lead find/create ---- */
 async function findOrCreateLead({ name, phone, product_line }) {
   let leadId = null;
 
-  // Search by criteria (more reliable than phone param)
+  // Reliable search by criteria (phone param can be finicky)
   try {
     const search = await zoho(
       `/crm/v2/Leads/search?criteria=(Phone:equals:${encodeURIComponent(phone)})`
     );
     if (search?.data?.length) leadId = search.data[0].id;
   } catch (_) {
-    // 204/NOT_FOUND etc → ignore and create
+    // 204/NOT_FOUND or 400 → ignore & create
   }
   if (leadId) return leadId;
 
-  // Allow custom API name for product field via env
+  // Allow custom API name via env if Product_Line differs in your org
   const productField = process.env.ZOHO_LEAD_PRODUCT_FIELD || "Product_Line";
 
   const record = {
@@ -138,7 +139,7 @@ async function findOrCreateLead({ name, phone, product_line }) {
   throw err;
 }
 
-// ---- Task create (try Who_Id → What_Id → What_Id+se_module; finally unlinked task) ----
+/* ---- Task create (Who_Id → What_Id → What_Id+se_module → Unlinked) ---- */
 async function createTask(leadId) {
   if (!leadId || typeof leadId !== "string" || leadId.length < 15) {
     throw Object.assign(new Error(`Invalid leadId: ${leadId}`), { status: 400 });
@@ -160,10 +161,10 @@ async function createTask(leadId) {
   if (row?.code === "SUCCESS") return row.details.id;
 
   const whoErr = Array.isArray(out?.data) && out.data.some(
-    d => d?.details?.api_name === "Who_Id" || d?.message?.includes?.("Who")
+    (d) => d?.details?.api_name === "Who_Id" || d?.message?.includes?.("Who")
   );
 
-  // 2) Try What_Id (some orgs prefer Related To)
+  // 2) If Who_Id rejected, try What_Id (Related To)
   if (whoErr) {
     payload = { data: [ { ...base, What_Id: { id: leadId } } ] };
     out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
@@ -172,10 +173,10 @@ async function createTask(leadId) {
   }
 
   const whatErr = Array.isArray(out?.data) && out.data.some(
-    d => d?.details?.api_name === "What_Id" || d?.message?.includes?.("What")
+    (d) => d?.details?.api_name === "What_Id" || d?.message?.includes?.("What")
   );
 
-  // 3) Try What_Id with se_module = Leads (कुछ orgs में जरूरी)
+  // 3) Try What_Id + se_module = Leads (some orgs require this)
   if (whoErr || whatErr) {
     payload = { data: [ { ...base, What_Id: { id: leadId }, se_module: "Leads" } ] };
     out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
@@ -183,17 +184,14 @@ async function createTask(leadId) {
     if (row?.code === "SUCCESS") return row.details.id;
   }
 
-  // 4) Final fallback: Unlinked task, but keep a trace
+  // 4) Final fallback: create unlinked task so workflow continues
   const fallback = {
     ...base,
     Description: `LeadId: ${leadId} (linking failed via Who_Id/What_Id)`,
   };
   const outFinal = await zoho("/crm/v2/Tasks", { method: "POST", body: { data: [fallback] } });
   const rowFinal = outFinal?.data?.[0];
-  if (rowFinal?.code === "SUCCESS") {
-    // आप चाहें तो response में बताएं कि task unlinked है
-    return rowFinal.details.id;
-  }
+  if (rowFinal?.code === "SUCCESS") return rowFinal.details.id;
 
   const err = new Error("Task create failed (Who_Id, What_Id, se_module tried)");
   err.status = 422;
@@ -201,13 +199,7 @@ async function createTask(leadId) {
   throw err;
 }
 
-  const err = new Error("Task create failed");
-  err.status = 422;
-  err.body = out;
-  throw err;
-}
-
-// ---- Routes ----
+/* ---- Routes ---- */
 app.get("/", (_req, res) =>
   res.send("✅ Omni–Zoho Dispatch Server (India DC) is running!")
 );
@@ -238,7 +230,7 @@ app.post("/api/dispatch-call", async (req, res) => {
   }
 });
 
-// 🔊 Bind to 0.0.0.0 and log on boot (helps avoid 502)
+/* ---- Start server (bind 0.0.0.0 for Render) ---- */
 app.listen(PORT, "0.0.0.0", () => {
   console.log("🚀 Server listening on", PORT);
   console.log("Zoho ACCOUNTS:", ACCOUNTS, "APIS:", APIS);
