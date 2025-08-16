@@ -1,4 +1,4 @@
-// Top-level crash logs
+// Top-level crash logs so 502/crashes show a reason
 process.on("unhandledRejection", (r) => console.error("UNHANDLED_REJECTION", r));
 process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
 
@@ -11,44 +11,52 @@ require("dotenv").config();
 const app = express();
 app.use(express.json());
 
-// ---- CORS ----
+// ---------- CORS (allowlist) ----------
 const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
-app.use((req, res, next) => { res.setHeader("Vary", "Origin"); next(); });
+// Helpful for proxies/CDN
+app.use((req, res, next) => {
+  res.setHeader("Vary", "Origin");
+  next();
+});
 
+// Use function (origin, cb) form
 app.use(cors({
-  origin: (origin, cb) => {     // ✅ सही: colon + arrow function
-    // Postman / no-origin allow
+  origin(origin, cb) {
+    // Postman/cURL / same-origin / server-side requests
     if (!origin) return cb(null, true);
-    // allow-list
     if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS: " + origin));
   },
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
-
+// Preflight
 app.options("*", cors());
 
 const PORT = process.env.PORT || 3000;
 const DUE_HOURS = Number(process.env.TASK_DUE_HOURS || 24);
 
-// ---- DC endpoints ----
+// ---------- Zoho DC Endpoints ----------
 const ACCOUNTS = (() => {
   const v = process.env.ZOHO_ACCESS_TOKEN_URL;
-  if (v) { try { return new URL(v).origin; } catch { return String(v).replace(/\/oauth\/v2\/token.*$/,""); } }
-  return "https://accounts.zoho.in";
+  if (v) {
+    try { return new URL(v).origin; } catch { return String(v).replace(/\/oauth\/v2\/token.*$/,''); }
+  }
+  return "https://accounts.zoho.in"; // India DC
 })();
 const APIS = (() => {
   const v = process.env.ZOHO_BASE_URL;
-  if (v) { try { return new URL(v).origin; } catch { return String(v); } }
-  return "https://www.zohoapis.in";
+  if (v) {
+    try { return new URL(v).origin; } catch { return String(v); }
+  }
+  return "https://www.zohoapis.in"; // India DC
 })();
 
-// ---- Token cache ----
+// ---------- OAuth token cache ----------
 let TOKEN_CACHE = { token: null, expiry: 0 };
 const tokenValid = () => TOKEN_CACHE.token && Date.now() < TOKEN_CACHE.expiry - 60_000;
 
@@ -59,169 +67,212 @@ async function refreshAccessToken() {
     client_secret: process.env.ZOHO_CLIENT_SECRET,
     refresh_token: process.env.ZOHO_REFRESH_TOKEN,
   });
+
   const res = await axios.post(`${ACCOUNTS}/oauth/v2/token`, form.toString(), {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     validateStatus: () => true,
   });
+
   if (res.status !== 200 || !res.data?.access_token) {
     const detail = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
-    throw Object.assign(new Error(`Refresh failed ${res.status}: ${detail}`), { status: res.status, body: res.data });
+    const err = new Error(`Refresh failed ${res.status}: ${detail}`);
+    err.status = res.status;
+    err.body = res.data;
+    throw err;
   }
+
   const { access_token, expires_in } = res.data;
   TOKEN_CACHE.token = access_token;
   TOKEN_CACHE.expiry = Date.now() + Number(expires_in || 3600) * 1000;
   return TOKEN_CACHE.token;
 }
-async function getAccessToken(force = false) { if (!force && tokenValid()) return TOKEN_CACHE.token; return refreshAccessToken(); }
+async function getAccessToken(force = false) {
+  if (!force && tokenValid()) return TOKEN_CACHE.token;
+  return refreshAccessToken();
+}
 
-// ---- Generic Zoho caller ----
+// ---------- Generic Zoho caller ----------
 async function zoho(path, { method = "GET", body } = {}) {
   let token = await getAccessToken();
   const url = `${APIS}${path}`;
+
   const call = () => axios({
-    url, method,
-    headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+    url,
+    method,
+    headers: {
+      Authorization: `Zoho-oauthtoken ${token}`, // NOTE: not 'Bearer'
+      "Content-Type": "application/json",
+    },
     data: body ? JSON.stringify(body) : undefined,
     validateStatus: () => true,
   });
+
   let res = await call();
+  const invalid =
+    res.status === 401 ||
+    res?.data?.code === "INVALID_TOKEN" ||
+    res?.data?.message === "INVALID_TOKEN";
 
-  const invalid = res.status === 401 || res?.data?.code === "INVALID_TOKEN" || res?.data?.message === "INVALID_TOKEN";
-  if (invalid) { token = await getAccessToken(true); res = await call(); }
-
+  if (invalid) {
+    token = await getAccessToken(true);
+    res = await call();
+  }
   if (res.status < 200 || res.status >= 300) {
-    throw Object.assign(new Error(`Zoho CRM ${res.status}`), { status: res.status, body: res.data });
+    const err = new Error(`Zoho CRM ${res.status}`);
+    err.status = res.status;
+    err.body = res.data;
+    throw err;
   }
   return res.data;
 }
 
-// ---- Utils ----
-function pad(n){ return n < 10 ? "0"+n : ""+n; }
-function formatZohoDateWithOffset(d = new Date(), offset = process.env.CALL_TZ_OFFSET || "+05:30") {
-  // returns 'YYYY-MM-DDTHH:mm:ss+05:30'
-  const tz = offset; // e.g. +05:30
-  // Convert UTC->offset (simple): we’ll emit local UTC time then append offset (Zoho accepts)
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}${tz}`;
+// ---------- Helpers ----------
+function safeString(v) {
+  return (v == null ? "" : String(v)).trim();
+}
+function makeLeadDescription({ message, source_url, utm }) {
+  const parts = [];
+  if (message) parts.push(`Message: ${message}`);
+  if (source_url) parts.push(`Source URL: ${source_url}`);
+  if (utm && (utm.utm_source || utm.utm_medium || utm.utm_campaign)) {
+    parts.push(
+      `UTM -> source=${utm.utm_source || ""}, medium=${utm.utm_medium || ""}, campaign=${utm.utm_campaign || ""}`
+    );
+  }
+  return parts.join("\n");
 }
 
-// ---- Lead find/create ----
-async function findOrCreateLead({ name, phone, product_line }) {
+// ---------- Lead find/create ----------
+async function findOrCreateLead({ name, phone, email, product_line, message, source_url, utm }) {
   let leadId = null;
+
   try {
-    const search = await zoho(`/crm/v2/Leads/search?criteria=(Phone:equals:${encodeURIComponent(phone)})`);
+    const search = await zoho(
+      `/crm/v2/Leads/search?criteria=${encodeURIComponent(`(Phone:equals:${phone})`)}`
+    );
     if (search?.data?.length) leadId = search.data[0].id;
-  } catch (_) { /* ignore 204/400 */ }
+  } catch (_) {
+    // 204/NOT_FOUND/400 etc → ignore
+  }
   if (leadId) return leadId;
 
   const productField = process.env.ZOHO_LEAD_PRODUCT_FIELD || "Product_Line";
+
   const record = {
-    Last_Name: name || "Incoming Lead",
+    Last_Name: safeString(name) || "Incoming Lead",
     Phone: phone,
     Company: "Unknown",
-    Lead_Source: "Incoming Call",
+    Lead_Source: "Website",
   };
+
+  if (email) record.Email = email;
   if (product_line) record[productField] = product_line;
+
+  const desc = makeLeadDescription({ message, source_url, utm });
+  if (desc) record.Description = desc;
 
   const created = await zoho("/crm/v2/Leads", { method: "POST", body: { data: [record] } });
   const row = created?.data?.[0];
   if (row?.code === "SUCCESS") return row.details.id;
 
-  throw Object.assign(new Error("Lead create failed"), { status: 422, body: created });
+  const err = new Error("Lead create failed");
+  err.status = 422;
+  err.body = created;
+  throw err;
 }
 
-// ---- Task create (Who_Id → What_Id → se_module → Unlinked) ----
-async function createTask(leadId) {
-  if (!leadId || typeof leadId !== "string" || leadId.length < 15) {
-    throw Object.assign(new Error(`Invalid leadId: ${leadId}`), { status: 400 });
+// ---------- Task: avoid duplicates & include phone in Subject ----------
+async function findOpenTaskForLead(leadId) {
+  // What_Id = leadId AND Status in (Not Started, In Progress)
+  const crit =
+    `(What_Id:equals:${leadId}) and (Status:equals:Not Started or Status:equals:In Progress)`;
+  try {
+    const resp = await zoho(`/crm/v2/Tasks/search?criteria=${encodeURIComponent(crit)}`);
+    const row = resp?.data?.[0];
+    return row?.id || null;
+  } catch (_) {
+    return null; // 204 / NOT_FOUND etc
   }
-  const due = new Date(); due.setHours(due.getHours() + DUE_HOURS);
-  const base = { Subject: "Follow up on incoming call", Status: "Not Started", Due_Date: due.toISOString().split("T")[0] };
+}
 
-  let payload = { data: [{ ...base, Who_Id: { id: leadId } }] };
+async function ensureFollowupTask(leadId, phone) {
+  if (!leadId) throw Object.assign(new Error("Invalid leadId"), { status: 400 });
+
+  const existing = await findOpenTaskForLead(leadId);
+  if (existing) return existing;
+
+  const due = new Date();
+  due.setHours(due.getHours() + DUE_HOURS);
+
+  // Base payload with Subject including phone
+  const base = {
+    Subject: `Follow up on incoming call – ${phone}`,
+    Status: "Not Started",
+    Due_Date: due.toISOString().split("T")[0],
+  };
+
+  // Primary attempt: What_Id + se_module=Leads
+  let payload = { data: [{ ...base, What_Id: { id: leadId }, se_module: "Leads" }] };
   let out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
   let row = out?.data?.[0];
   if (row?.code === "SUCCESS") return row.details.id;
 
-  const whoErr = Array.isArray(out?.data) && out.data.some(d => d?.details?.api_name === "Who_Id" || d?.message?.includes?.("Who"));
+  // Fallback: Who_Id (some orgs accept this linkage)
+  payload = { data: [{ ...base, Who_Id: { id: leadId } }] };
+  out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
+  row = out?.data?.[0];
+  if (row?.code === "SUCCESS") return row.details.id;
 
-  if (whoErr) {
-    payload = { data: [{ ...base, What_Id: { id: leadId } }] };
-    out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
-    row = out?.data?.[0];
-    if (row?.code === "SUCCESS") return row.details.id;
-  }
-
-  const whatErr = Array.isArray(out?.data) && out.data.some(d => d?.details?.api_name === "What_Id" || d?.message?.includes?.("What"));
-
-  if (whoErr || whatErr) {
-    payload = { data: [{ ...base, What_Id: { id: leadId }, se_module: "Leads" }] };
-    out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
-    row = out?.data?.[0];
-    if (row?.code === "SUCCESS") return row.details.id;
-  }
-
-  const fallback = { ...base, Description: `LeadId: ${leadId} (linking failed via Who_Id/What_Id)` };
-  const outFinal = await zoho("/crm/v2/Tasks", { method: "POST", body: { data: [fallback] } });
+  // Final fallback: unlinked task so workflow continues
+  const finalPayload = {
+    data: [{
+      ...base,
+      Description: `LeadId: ${leadId} (linking failed)`,
+    }]
+  };
+  const outFinal = await zoho("/crm/v2/Tasks", { method: "POST", body: finalPayload });
   const rowFinal = outFinal?.data?.[0];
   if (rowFinal?.code === "SUCCESS") return rowFinal.details.id;
 
-  throw Object.assign(new Error("Task create failed (Who_Id, What_Id, se_module tried)"), { status: 422, body: { first: out, final: outFinal } });
+  const err = new Error("Task create failed (What_Id/Who_Id/se_module tried)");
+  err.status = 422;
+  err.body = { first: out, final: outFinal };
+  throw err;
 }
 
-// ---- Call log (best-effort) ----
-async function createCallLog({ leadId, phone, name }) {
-  const when = formatZohoDateWithOffset(new Date());
-  const base = {
-    Call_Type: "Outbound",
-    Call_Status: "Completed",
-    Subject: `Outbound call ${name ? "– " + name : ""}`.trim(),
-    Call_Start_Time: when,
-    Call_Duration: 0,
-    Description: phone ? `Phone: ${phone}` : undefined,
-  };
-
-  // 1) What_Id + se_module (recommended for Leads)
-  let payload = { data: [{ ...base, What_Id: { id: leadId }, se_module: "Leads" }] };
-  let out = await zoho("/crm/v2/Calls", { method: "POST", body: payload });
-  let row = out?.data?.[0];
-  if (row?.code === "SUCCESS") return row.details.id;
-
-  // 2) Who_Id
-  payload = { data: [{ ...base, Who_Id: { id: leadId } }] };
-  out = await zoho("/crm/v2/Calls", { method: "POST", body: payload });
-  row = out?.data?.[0];
-  if (row?.code === "SUCCESS") return row.details.id;
-
-  // 3) Unlinked log (at least keep a record)
-  payload = { data: [{ ...base }] };
-  out = await zoho("/crm/v2/Calls", { method: "POST", body: payload });
-  row = out?.data?.[0];
-  if (row?.code === "SUCCESS") return row.details.id;
-
-  throw Object.assign(new Error("Call log create failed (Who_Id, What_Id, se_module tried)"), { status: 422, body: out });
-}
-
-// ---- Routes ----
+// ---------- Routes ----------
 app.get("/", (_req, res) => res.send("✅ Omni–Zoho Dispatch Server (India DC) is running!"));
 app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 app.post("/api/dispatch-call", async (req, res) => {
   try {
-    const { name, phone, product_line } = req.body || {};
-    if (!phone) return res.status(400).json({ success: false, message: "phone is required" });
+    // Accept extra fields from the website form
+    const {
+      name,
+      phone,
+      email,
+      product_line,
+      message,
+      source_url,
+      utm_source,
+      utm_medium,
+      utm_campaign,
+    } = req.body || {};
 
-    const leadId = await findOrCreateLead({ name, phone, product_line });
-    const taskId = await createTask(leadId);
-
-    // Call log is best-effort; failure won't block success
-    let callId = null;
-    try {
-      callId = await createCallLog({ leadId, phone, name });
-    } catch (e) {
-      console.warn("Call log failed:", e.status, e.body || e.message);
+    if (!phone) {
+      return res.status(400).json({ success: false, message: "phone is required" });
     }
 
-    return res.json({ success: true, leadId, taskId, callId });
+    const utm = { utm_source, utm_medium, utm_campaign };
+
+    const leadId = await findOrCreateLead({
+      name, phone, email, product_line, message, source_url, utm,
+    });
+
+    // Task subject now contains phone + duplicate prevention
+    const taskId = await ensureFollowupTask(leadId, phone);
+
+    return res.json({ success: true, leadId, taskId });
   } catch (err) {
     const status = err.status || err.response?.status || 500;
     console.error("ERROR:", status, err.body || err.response?.data || err.message);
@@ -233,7 +284,7 @@ app.post("/api/dispatch-call", async (req, res) => {
   }
 });
 
-// ---- Start server ----
+// ---------- Start server ----------
 app.listen(PORT, "0.0.0.0", () => {
   console.log("🚀 Server listening on", PORT);
   console.log("Zoho ACCOUNTS:", ACCOUNTS, "APIS:", APIS);
