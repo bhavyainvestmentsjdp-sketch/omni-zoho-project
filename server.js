@@ -100,40 +100,50 @@ async function zoho(path, { method = "GET", body } = {}) {
 }
 
 // ---- Lead find/create ----
-async function findOrCreateLead({ name, phone, product_line }) {
-  let leadId = null;
-
-  // Reliable search by criteria
-  try {
-    const search = await zoho(
-      `/crm/v2/Leads/search?criteria=(Phone:equals:${encodeURIComponent(phone)})`
-    );
-    if (search?.data?.length) leadId = search.data[0].id;
-  } catch (_) {
-    // 204/NOT_FOUND etc → ignore and create
+async function createTask(leadId) {
+  if (!leadId || typeof leadId !== "string" || leadId.length < 15) {
+    throw Object.assign(new Error(`Invalid leadId: ${leadId}`), { status: 400 });
   }
-  if (leadId) return leadId;
 
-  // In case your custom field API name differs, allow override:
-  const productField = process.env.ZOHO_LEAD_PRODUCT_FIELD || "Product_Line";
+  const due = new Date();
+  due.setHours(due.getHours() + DUE_HOURS);
 
-  const record = {
-    Last_Name: name || "Incoming Lead",
-    Phone: phone,
-    Company: "Unknown",
-    Lead_Source: "Incoming Call",
+  const base = {
+    Subject: "Follow up on incoming call",
+    Status: "Not Started",
+    Due_Date: due.toISOString().split("T")[0], // YYYY-MM-DD
   };
-  if (product_line) record[productField] = product_line;
 
-  const created = await zoho("/crm/v2/Leads", { method: "POST", body: { data: [record] } });
-  const row = created?.data?.[0];
+  // 1) Try Who_Id (Lead/Contact)
+  let payload = { data: [ { ...base, Who_Id: { id: leadId } } ] };
+  let out = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
+  let row = out?.data?.[0];
   if (row?.code === "SUCCESS") return row.details.id;
 
-  const err = new Error("Lead create failed");
+  const whoErr = Array.isArray(out?.data) && out.data.some(
+    d => d?.details?.api_name === "Who_Id" || d?.message?.includes("Who")
+  );
+
+  // 2) If Who_Id rejected, try What_Id (some orgs disallow Leads on Who_Id)
+  if (whoErr) {
+    payload = { data: [ { ...base, What_Id: { id: leadId } } ] };
+    const out2 = await zoho("/crm/v2/Tasks", { method: "POST", body: payload });
+    const row2 = out2?.data?.[0];
+    if (row2?.code === "SUCCESS") return row2.details.id;
+
+    const err2 = new Error("Task create failed (Who_Id & What_Id both rejected)");
+    err2.status = 422;
+    err2.body = { first: out, second: out2 };
+    throw err2;
+  }
+
+  // 3) Other errors
+  const err = new Error("Task create failed");
   err.status = 422;
-  err.body = created;
+  err.body = out;
   throw err;
 }
+
 
 // ---- Task create (link to Lead via Who_Id) ----
 async function createTask(leadId) {
